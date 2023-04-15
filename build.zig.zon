@@ -1,0 +1,10 @@
+.{
+	.name = "dolly",
+	.version = "0.1.0",
+	.dependencies = .{
+		.ggml = .{
+			.url = "https://github.com/leroycep/ggml/archive/1c65bbadc8fe583b77bda3a870e2f91d1be9e3ac.tar.gz",
+			.hash = "1220f98ead985c31dcfd37f14a4f6ff38b5a5b876a8d1cf421c864f8b3f08b50ad6d",
+		},
+	},
+}
