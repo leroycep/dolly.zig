@@ -20,11 +20,12 @@ layers: []Layer,
 memory_k: *c.ggml_tensor,
 memory_v: *c.ggml_tensor,
 
+memory_k_buf: []u8,
+memory_v_buf: []u8,
+
 //
 ctx: *c.ggml_context,
 
-/// Contains all of the tokens in one big slice
-tokens_arena: std.heap.ArenaAllocator,
 /// Token ID == location in array hashmap
 tokens: std.StringArrayHashMapUnmanaged(void),
 
@@ -90,8 +91,8 @@ pub fn load(allocator: std.mem.Allocator, filename: []const u8, n_ctx: u32) !Mod
     errdefer model.file.close();
     const file_len = try model.file.getEndPos();
 
-    const file_buf = try std.os.mmap(null, file_len, std.os.PROT.READ, std.os.MAP.SHARED, model.file.handle, 0);
-    errdefer std.os.munmap(file_buf);
+    model.file_buf = try std.os.mmap(null, file_len, std.os.PROT.READ, std.os.MAP.SHARED, model.file.handle, 0);
+    errdefer std.os.munmap(model.file_buf);
 
     // verify magic
     {
@@ -126,13 +127,12 @@ pub fn load(allocator: std.mem.Allocator, filename: []const u8, n_ctx: u32) !Mod
     // load vocab
     model.tokens = .{};
     errdefer model.tokens.deinit(allocator);
-    model.tokens_arena = std.heap.ArenaAllocator.init(allocator);
-    errdefer model.tokens_arena.deinit();
     for (0..model.hparams.n_vocab) |_| {
         const len = try model.file.reader().readIntLittle(u32);
 
-        const word = try model.tokens_arena.allocator().alloc(u8, len);
-        try model.file.reader().readNoEof(word);
+        const offset = try model.file.getPos();
+        const word = model.file_buf[offset..][0..len];
+        try model.file.seekBy(len);
 
         try model.tokens.put(allocator, word, {});
     }
@@ -255,17 +255,24 @@ pub fn load(allocator: std.mem.Allocator, filename: []const u8, n_ctx: u32) !Mod
     }
 
     // key + value memory
-    {
-        const n_mem = model.hparams.n_layer * model.hparams.n_ctx;
-        const n_elements = model.hparams.n_embd * n_mem;
+    const n_mem = model.hparams.n_layer * model.hparams.n_ctx;
+    const n_elements = model.hparams.n_embd * n_mem;
 
-        model.memory_k = c.ggml_new_tensor_1d(model.ctx, c.GGML_TYPE_F32, n_elements);
-        model.memory_v = c.ggml_new_tensor_1d(model.ctx, c.GGML_TYPE_F32, n_elements);
+    model.memory_k = c.ggml_new_tensor_1d(model.ctx, c.GGML_TYPE_F32, n_elements);
+    model.memory_v = c.ggml_new_tensor_1d(model.ctx, c.GGML_TYPE_F32, n_elements);
 
-        const memory_size = c.ggml_nbytes(model.memory_k) + c.ggml_nbytes(model.memory_v);
+    const memory_size = c.ggml_nbytes(model.memory_k) + c.ggml_nbytes(model.memory_v);
 
-        std.log.info("{s}: memory size = {d:8.2} MB, n_mem = {d}", .{ @src().fn_name, @intToFloat(f32, memory_size) / (1024 * 1024), n_mem });
-    }
+    model.memory_k_buf = try allocator.alloc(u8, memory_size);
+    errdefer allocator.free(model.memory_k_buf);
+
+    model.memory_v_buf = try allocator.alloc(u8, memory_size);
+    errdefer allocator.free(model.memory_v_buf);
+
+    model.memory_k.*.data = model.memory_k_buf.ptr;
+    model.memory_v.*.data = model.memory_v_buf.ptr;
+
+    std.log.info("{s}: memory size = {d:8.2} MB, n_mem = {d}", .{ @src().fn_name, @intToFloat(f32, memory_size) / (1024 * 1024), n_mem });
 
     // load weights
     {
@@ -419,7 +426,224 @@ pub fn deinit(this: *@This()) void {
     this.allocator.free(this.layers);
     this.allocator.free(this.ggml_mem_buffer);
     this.tokens.deinit(this.allocator);
-    this.tokens_arena.deinit();
+    std.os.munmap(this.file_buf);
+    this.file.close();
+}
+
+const EvalOptions = struct {
+    n_threads: usize = 1,
+    n_past: usize = 10,
+};
+
+pub fn eval(this: @This(), allocator: std.mem.Allocator, input_embeddings: []const usize, options: EvalOptions) ![]f32 {
+    const buf = try allocator.alloc(u8, 100 * 1024 * 1024);
+    defer allocator.free(buf);
+    var params = c.ggml_init_params{
+        .mem_buffer = buf.ptr,
+        .mem_size = buf.len,
+        .no_alloc = false,
+    };
+
+    const ctx = c.ggml_init(params);
+    defer c.ggml_free(ctx);
+
+    var compute_graph = std.mem.zeroInit(c.ggml_cgraph, .{
+        .n_threads = 1,
+    });
+
+    const embd = c.ggml_new_tensor_1d(ctx, c.GGML_TYPE_I32, @intCast(i64, input_embeddings.len));
+    std.mem.copy(usize, @ptrCast([*]usize, @alignCast(@alignOf(usize), embd.*.data))[0..input_embeddings.len], input_embeddings);
+
+    var input_layer = c.ggml_get_rows(ctx, this.wte, embd);
+    for (this.layers, 0..) |layer, il| {
+        var cur = c.ggml_norm(ctx, input_layer);
+        cur = c.ggml_add(
+            ctx,
+            c.ggml_mul(
+                ctx,
+                c.ggml_repeat(ctx, layer.input_layernorm_weight, cur),
+                cur,
+            ),
+            c.ggml_repeat(ctx, layer.input_layernorm_bias, cur),
+        );
+
+        var q_cur = c.ggml_mul_mat(ctx, layer.c_attn_q_proj_w, cur);
+        var k_cur = c.ggml_mul_mat(ctx, layer.c_attn_k_proj_w, cur);
+        var v_cur = c.ggml_mul_mat(ctx, layer.c_attn_v_proj_w, cur);
+
+        q_cur = c.ggml_add(ctx, q_cur, c.ggml_repeat(ctx, layer.c_attn_q_proj_bias, q_cur));
+        k_cur = c.ggml_add(ctx, k_cur, c.ggml_repeat(ctx, layer.c_attn_k_proj_bias, k_cur));
+        v_cur = c.ggml_add(ctx, v_cur, c.ggml_repeat(ctx, layer.c_attn_v_proj_bias, v_cur));
+
+        if (input_embeddings.len >= 1) {
+            const k = c.ggml_view_1d(ctx, this.memory_k, @intCast(i64, input_embeddings.len * this.hparams.n_embd), (c.ggml_element_size(this.memory_k) * this.hparams.n_embd) * (il * this.hparams.n_ctx + options.n_past));
+            const v = c.ggml_view_1d(ctx, this.memory_v, @intCast(i64, input_embeddings.len * this.hparams.n_embd), (c.ggml_element_size(this.memory_v) * this.hparams.n_embd) * (il * this.hparams.n_ctx + options.n_past));
+
+            c.ggml_build_forward_expand(&compute_graph, c.ggml_cpy(ctx, k_cur, k));
+            c.ggml_build_forward_expand(&compute_graph, c.ggml_cpy(ctx, v_cur, v));
+        }
+
+        var q = c.ggml_permute(ctx, c.ggml_rope(
+            ctx,
+            c.ggml_cpy(ctx, q_cur, c.ggml_new_tensor_3d(
+                ctx,
+                c.GGML_TYPE_F32,
+                this.hparams.n_embd / this.hparams.n_head,
+                this.hparams.n_head,
+                @intCast(i64, input_embeddings.len),
+            )),
+            @intCast(c_int, options.n_past),
+            @intCast(c_int, this.hparams.n_rot),
+            0,
+        ), 0, 2, 1, 3);
+
+        var k = c.ggml_permute(ctx, c.ggml_rope(
+            ctx, // "change Qcur" in line 2270.)
+            c.ggml_reshape_3d(
+                ctx,
+                c.ggml_view_1d(
+                    ctx,
+                    this.memory_k,
+                    @intCast(i64, (options.n_past + input_embeddings.len) * this.hparams.n_embd),
+                    il * this.hparams.n_ctx * c.ggml_element_size(this.memory_k) * this.hparams.n_embd,
+                ),
+                this.hparams.n_embd / this.hparams.n_head,
+                this.hparams.n_head,
+                @intCast(i64, options.n_past + input_embeddings.len),
+            ),
+            @intCast(c_int, options.n_past),
+            @intCast(c_int, this.hparams.n_rot),
+            1,
+        ), 0, 2, 1, 3);
+        var kq = c.ggml_mul_mat(ctx, k, q);
+
+        var kq_scaled = c.ggml_scale(
+            ctx,
+            kq,
+            c.ggml_new_f32(
+                ctx,
+                1.0 / @sqrt(@intToFloat(f32, this.hparams.n_embd) / @intToFloat(f32, this.hparams.n_head)),
+            ),
+        );
+
+        var kq_masked = c.ggml_diag_mask_inf(ctx, kq_scaled, @intCast(c_int, options.n_past));
+        const kq_soft_max = c.ggml_soft_max(ctx, kq_masked);
+        const v_trans = c.ggml_dup_tensor(ctx, c.ggml_permute(
+            ctx,
+            c.ggml_reshape_3d(
+                ctx,
+                c.ggml_view_1d(
+                    ctx,
+                    this.memory_v,
+                    @intCast(i64, (options.n_past + input_embeddings.len) * this.hparams.n_embd),
+                    il * this.hparams.n_ctx * c.ggml_element_size(this.memory_v) * this.hparams.n_embd,
+                ),
+                this.hparams.n_embd / this.hparams.n_head,
+                this.hparams.n_head,
+                @intCast(i64, options.n_past + input_embeddings.len),
+            ),
+            1,
+            2,
+            0,
+            3,
+        ));
+        const kqv = c.ggml_mul_mat(ctx, v_trans, kq_soft_max);
+        const kqv_merged = c.ggml_permute(ctx, kqv, 0, 2, 1, 3);
+
+        cur = c.ggml_cpy(ctx, kqv_merged, c.ggml_new_tensor_2d(ctx, c.GGML_TYPE_F32, this.hparams.n_embd, @intCast(i64, input_embeddings.len)));
+
+        // projection (first weight)
+        cur = c.ggml_mul_mat(ctx, layer.c_attn_proj_w, cur);
+
+        // projection (then bias)
+        cur = c.ggml_add(ctx, c.ggml_repeat(ctx, layer.c_attn_proj_bias, cur), cur);
+
+        var inpFF: *c.ggml_tensor = undefined;
+
+        if (this.hparams.use_parallel_residual == 0) {
+            std.debug.print("use_parallel_residual == 0\n", .{});
+            // This takes the self-attention residual output as input to Feedforward
+            inpFF = c.ggml_add(ctx, cur, input_layer);
+
+            // post attention layer norm
+            {
+                inpFF = c.ggml_norm(ctx, inpFF);
+
+                // inpFF = input_layernorm_weight*inpFF + input_layernorm_bias
+                inpFF = c.ggml_add(ctx, c.ggml_mul(ctx, c.ggml_repeat(ctx, layer.post_attention_layernorm_weight, inpFF), inpFF), c.ggml_repeat(ctx, layer.post_attention_layernorm_bias, inpFF));
+            }
+
+            // feed-forward network
+            {
+                // note here we pass inpFF instead of cur
+                inpFF = c.ggml_mul_mat(ctx, layer.c_mlp_fc_w, inpFF);
+
+                inpFF = c.ggml_add(ctx, c.ggml_repeat(ctx, layer.c_mlp_fc_b, inpFF), inpFF);
+
+                inpFF = c.ggml_gelu(ctx, inpFF);
+
+                inpFF = c.ggml_mul_mat(ctx, layer.c_mlp_proj_w_trans, inpFF);
+
+                inpFF = c.ggml_add(ctx, c.ggml_repeat(ctx, layer.c_mlp_proj_b, inpFF), inpFF);
+            }
+
+            // input_layer = inpFF + input_layer
+            input_layer = c.ggml_add(ctx, inpFF, input_layer);
+        } else if (this.hparams.use_parallel_residual == 1) {
+            // printf("use_parallel_residual == 1\n");
+            // This is independent of the self-attention result, so it could be done in parallel to the self-attention
+
+            // post attention layer norm
+            {
+                inpFF = c.ggml_norm(ctx, input_layer);
+
+                // inpFF = input_layernorm_weight*inpFF + input_layernorm_bias
+                inpFF = c.ggml_add(ctx, c.ggml_mul(ctx, c.ggml_repeat(ctx, layer.post_attention_layernorm_weight, inpFF), inpFF), c.ggml_repeat(ctx, layer.post_attention_layernorm_bias, inpFF));
+            }
+
+            // feed-forward network
+            {
+                // note here we pass inpFF instead of cur
+                inpFF = c.ggml_mul_mat(ctx, layer.c_mlp_fc_w, inpFF);
+
+                inpFF = c.ggml_add(ctx, c.ggml_repeat(ctx, layer.c_mlp_fc_b, inpFF), inpFF);
+
+                // GELU activation
+                inpFF = c.ggml_gelu(ctx, inpFF);
+
+                // projection
+                // inpFF = proj_w*inpFF + proj_b
+                inpFF = c.ggml_mul_mat(ctx, layer.c_mlp_proj_w_trans, inpFF);
+
+                inpFF = c.ggml_add(ctx, c.ggml_repeat(ctx, layer.c_mlp_proj_b, inpFF), inpFF);
+            }
+
+            // r = r + inpFF + cur
+            inpFF = c.ggml_add(ctx, cur, inpFF);
+            input_layer = c.ggml_add(ctx, input_layer, inpFF);
+        } else {
+            std.debug.panic("use_parallel_residual == {}\n", .{this.hparams.use_parallel_residual});
+        }
+    }
+
+    // norm
+    {
+        input_layer = c.ggml_norm(ctx, input_layer);
+
+        // input_layer = ln_f_g*input_layer + ln_f_b
+        input_layer = c.ggml_add(ctx, c.ggml_mul(ctx, c.ggml_repeat(ctx, this.ln_f_g, input_layer), input_layer), c.ggml_repeat(ctx, this.ln_f_b, input_layer));
+    }
+
+    // lm_head
+    {
+        input_layer = c.ggml_mul_mat(ctx, this.lmh_g, input_layer);
+    }
+
+    // run the computation
+    c.ggml_build_forward_expand(&compute_graph, input_layer);
+    c.ggml_graph_compute(ctx, &compute_graph);
+
+    return &.{};
 }
 
 const std = @import("std");

@@ -10,6 +10,9 @@ pub fn main() !void {
 
     var model = try GPTNeoX.load(gpa.allocator(), args[1], 100);
     defer model.deinit();
+
+    const output = try model.eval(gpa.allocator(), &.{}, .{});
+    defer gpa.allocator().free(output);
 }
 
 const END_KEY = "### End";
